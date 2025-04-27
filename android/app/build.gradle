@@ -129,8 +129,8 @@ dependencies {
     implementation("com.facebook.react:react-android")
     
     // MediaPipe dependencies - use the correct versions
-    implementation 'com.google.mediapipe:tasks-vision:0.10.9'
-    implementation 'com.google.mediapipe:tasks-core:0.10.9'
+    implementation 'com.google.mediapipe:tasks-vision:0.10.21'
+    implementation 'com.google.mediapipe:tasks-core:0.10.21'
     
     // Additional required dependencies
     implementation 'com.google.protobuf:protobuf-javalite:3.19.4'

@@ -14,7 +14,6 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 
-import com.google.mediapipe.framework.MediaPipeException;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.core.BaseOptions;
@@ -26,13 +25,15 @@ import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class MediaPipeModule extends ReactContextBaseJavaModule {
     private static final String TAG = "MediaPipeModule";
-    private static final String MODEL_FILE = "pose_landmarker_lite.task";
+    private static final String MODEL_FILE = "pose_landmarker_full.task";
     private final ReactApplicationContext reactContext;
     private PoseLandmarker poseLandmarker;
     private boolean isInitialized = false;
@@ -47,7 +48,7 @@ public class MediaPipeModule extends ReactContextBaseJavaModule {
         return "MediaPipeModule";
     }
 
-    private File copyAssetToFile(String assetName) throws IOException {
+    private File copyAssetToFile(String assetName) throws Exception {
         File outFile = new File(reactContext.getFilesDir(), assetName);
         if (!outFile.exists()) {
             try (InputStream in = reactContext.getAssets().open(assetName);
@@ -66,22 +67,21 @@ public class MediaPipeModule extends ReactContextBaseJavaModule {
     public void initialize(Promise promise) {
         try {
             if (!isInitialized) {
-                // Copy model file from assets to internal storage
                 File modelFile = copyAssetToFile(MODEL_FILE);
-                
-                // Setup PoseLandmarker options
+
                 BaseOptions baseOptions = BaseOptions.builder()
-                    .setModelAssetPath(modelFile.getAbsolutePath())
-                    .build();
+                        .setModelAssetPath(modelFile.getAbsolutePath())
+                        
+                        .build(); // 🚀 No need to set delegate manually
 
                 PoseLandmarker.PoseLandmarkerOptions options = PoseLandmarker.PoseLandmarkerOptions.builder()
-                    .setBaseOptions(baseOptions)
-                    .setRunningMode(RunningMode.IMAGE)
-                    .setMinPoseDetectionConfidence(0.5f)
-                    .setMinPosePresenceConfidence(0.5f)
-                    .setMinTrackingConfidence(0.5f)
-                    .setNumPoses(1)
-                    .build();
+                        .setBaseOptions(baseOptions)
+                        .setRunningMode(RunningMode.VIDEO)
+                        .setMinPoseDetectionConfidence(0.5f)
+                        .setMinPosePresenceConfidence(0.5f)
+                        .setMinTrackingConfidence(0.5f)
+                        .setNumPoses(1)
+                        .build();
 
                 poseLandmarker = PoseLandmarker.createFromOptions(reactContext, options);
                 isInitialized = true;
@@ -100,110 +100,96 @@ public class MediaPipeModule extends ReactContextBaseJavaModule {
             return;
         }
 
+        ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        WritableArray allFramesResults = Arguments.createArray();
+
         try {
-            // Parse the URI
             Uri uri = Uri.parse(videoUri);
-            
-            // Create a media retriever
             MediaMetadataRetriever retriever = new MediaMetadataRetriever();
             if (videoUri.startsWith("content://")) {
                 retriever.setDataSource(reactContext, uri);
             } else {
                 retriever.setDataSource(uri.getPath());
             }
-            
-            // Get video duration
+
             String durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
-            long duration = Long.parseLong(durationStr) * 1000; // Convert to microseconds
-            
-            // Process frames at intervals (10 FPS for smoother playback)
-            long frameInterval = 100000; // 100ms = 10 FPS
-            WritableArray allFramesResults = Arguments.createArray();
-            
-            // Process all frames for the entire video
+            long duration = Long.parseLong(durationStr);
+            long frameInterval = 66; // ~15 FPS
+
             for (long time = 0; time < duration; time += frameInterval) {
-                Bitmap frame = retriever.getFrameAtTime(time, MediaMetadataRetriever.OPTION_CLOSEST);
-                
-                if (frame != null) {
-                    // Process frame with MediaPipe
-                    WritableMap frameResult = processFrame(frame, time / 1000.0); // Convert back to ms
-                    
-                    if (frameResult != null) {
-                        allFramesResults.pushMap(frameResult);
+                final long timestamp = time;
+                executor.execute(() -> {
+                    try {
+                        Bitmap frame = retriever.getFrameAtTime(timestamp * 1000, MediaMetadataRetriever.OPTION_CLOSEST);
+                        if (frame != null) {
+                            int scaledWidth = 256;
+                            int scaledHeight = (int) (frame.getHeight() * (scaledWidth / (float) frame.getWidth()));
+                            Bitmap scaledFrame = Bitmap.createScaledBitmap(frame, scaledWidth, scaledHeight, true);
+
+                            MPImage mpImage = new BitmapImageBuilder(scaledFrame).build();
+                            PoseLandmarkerResult result = poseLandmarker.detectForVideo(mpImage, timestamp);
+
+                            if (result != null && !result.landmarks().isEmpty()) {
+                                WritableMap frameResult = createFrameResult(frame, result, timestamp);
+                                synchronized (allFramesResults) {
+                                    allFramesResults.pushMap(frameResult);
+                                }
+                            }
+                            scaledFrame.recycle();
+                            frame.recycle();
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error processing frame at timestamp: " + timestamp, e);
                     }
-                    
-                    frame.recycle();
-                }
+                });
             }
-            
+
+            executor.shutdown();
+            executor.awaitTermination(1, TimeUnit.HOURS);
             retriever.release();
+
             promise.resolve(allFramesResults);
-            
         } catch (Exception e) {
             Log.e(TAG, "Error processing video", e);
             promise.reject("PROCESS_ERROR", "Failed to process video: " + e.getMessage(), e);
         }
     }
-    
-    private WritableMap processFrame(Bitmap frame, double timestamp) {
-        try {
-            // Convert Bitmap to MPImage
-            MPImage mpImage = new BitmapImageBuilder(frame).build();
-            
-            // Process the image
-            PoseLandmarkerResult result = poseLandmarker.detect(mpImage);
-            
-            if (result == null || result.landmarks().isEmpty()) {
-                return null;
-            }
-            
-            WritableMap frameResult = Arguments.createMap();
-            frameResult.putDouble("timestamp", timestamp);
-            
-            // Convert frame to base64
-            String frameBase64 = bitmapToBase64(frame);
-            frameResult.putString("frameImage", "data:image/jpeg;base64," + frameBase64);
-            
-            // Extract landmarks
-            WritableArray landmarks = Arguments.createArray();
-            List<NormalizedLandmark> poseLandmarks = result.landmarks().get(0);
-            
-            for (int i = 0; i < poseLandmarks.size(); i++) {
-                NormalizedLandmark landmark = poseLandmarks.get(i);
-                WritableMap landmarkMap = Arguments.createMap();
-                
-                landmarkMap.putString("name", getLandmarkName(i));
-                landmarkMap.putDouble("x", landmark.x());
-                landmarkMap.putDouble("y", landmark.y());
-                landmarkMap.putDouble("z", landmark.z());
-                
-                // Calculate visibility (using default value since presence is optional)
-                landmarkMap.putDouble("visibility", 1.0);
-                
-                landmarks.pushMap(landmarkMap);
-            }
-            
-            frameResult.putArray("landmarks", landmarks);
-            return frameResult;
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Error processing frame", e);
-            return null;
+
+    private WritableMap createFrameResult(Bitmap frame, PoseLandmarkerResult result, double timestamp) {
+        WritableMap frameResult = Arguments.createMap();
+        frameResult.putDouble("timestamp", timestamp);
+
+        String frameBase64 = bitmapToBase64(frame);
+        frameResult.putString("frameImage", "data:image/jpeg;base64," + frameBase64);
+
+        WritableArray landmarks = Arguments.createArray();
+        List<NormalizedLandmark> poseLandmarks = result.landmarks().get(0);
+
+        for (int i = 0; i < poseLandmarks.size(); i++) {
+            NormalizedLandmark landmark = poseLandmarks.get(i);
+            WritableMap landmarkMap = Arguments.createMap();
+            landmarkMap.putString("name", getLandmarkName(i));
+            landmarkMap.putDouble("x", landmark.x());
+            landmarkMap.putDouble("y", landmark.y());
+            landmarkMap.putDouble("z", landmark.z());
+            landmarkMap.putDouble("visibility", landmark.visibility().orElse(1.0f));
+            landmarkMap.putDouble("presence", landmark.presence().orElse(1.0f));
+            landmarks.pushMap(landmarkMap);
         }
+
+        frameResult.putArray("landmarks", landmarks);
+        return frameResult;
     }
-    
+
     private String bitmapToBase64(Bitmap bitmap) {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        // Compress to reduce size while maintaining quality for video playback
-        Bitmap scaledBitmap = Bitmap.createScaledBitmap(bitmap, 640, 360, true);
-        scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 75, outputStream);
-        byte[] byteArray = outputStream.toByteArray();
-        scaledBitmap.recycle(); // Free memory immediately
-        return Base64.encodeToString(byteArray, Base64.NO_WRAP);
+        Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, 480, 270, true);
+        resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream);
+        resizedBitmap.recycle();
+        return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP);
     }
-    
+
     private String getLandmarkName(int index) {
-        // Map MediaPipe landmark indices to names
         switch (index) {
             case 0: return "NOSE";
             case 1: return "LEFT_EYE_INNER";
